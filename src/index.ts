@@ -2,7 +2,8 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { randomBytes, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 
@@ -31,6 +32,13 @@ const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
 type OAuthTokens = { access: string; refresh: string; expires: number };
 
+type IntrospectionResult = {
+  version: string;
+  userAgent: string;
+  betaHeaders: string[];
+  scopes: string;
+};
+
 // ── Binary Introspection ─────────────────────────────────────────────────────
 // Reads version, beta headers, and scopes directly from the Claude CLI binary
 // to stay in sync with Anthropic API requirements without hardcoding values.
@@ -42,29 +50,133 @@ const KNOWN_BETA_PREFIXES = [
   "oauth-",
 ];
 
-async function introspectClaudeBinary(): Promise<{
-  version: string;
-  userAgent: string;
-  betaHeaders: string[];
-  scopes: string;
-} | null> {
-  try {
-    const { stdout: versionOut } = await execFileAsync(
-      "claude",
-      ["--version"],
-      { timeout: 5000 },
-    );
-    const version = versionOut.trim().split(" ")[0] || DEFAULT_VERSION;
+const IS_WIN = platform() === "win32";
+const CLAUDE_CMD = IS_WIN ? "claude.exe" : "claude";
 
-    const { stdout: whichOut } = await execFileAsync("which", ["claude"], {
+// ── Stream Scanner (Windows) ─────────────────────────────────────────────────
+// Scans a binary file in 256KB chunks to extract regex matches without loading
+// the entire file into memory. Uses latin1 encoding (1:1 byte→char mapping)
+// to safely handle binary content while matching ASCII-only patterns.
+// Peak memory: ~256KB + overlap, vs 500MB+ with readFile().toString().
+
+const SCAN_CHUNK_SIZE = 256 * 1024;
+const SCAN_OVERLAP = 128; // bytes kept between chunks for boundary matches
+
+async function streamScanBinary(
+  binaryPath: string,
+  patterns: RegExp[],
+): Promise<string[][]> {
+  return new Promise((resolve, reject) => {
+    const results: Set<string>[] = patterns.map(() => new Set());
+    let tail = "";
+
+    const stream = createReadStream(binaryPath, {
+      highWaterMark: SCAN_CHUNK_SIZE,
+    });
+
+    stream.on("data", (chunk: Buffer) => {
+      const raw = chunk.toString("latin1");
+      const text = tail + raw;
+      for (let i = 0; i < patterns.length; i++) {
+        // Ensure global flag so exec() advances lastIndex (prevents infinite loop)
+        const flags = patterns[i].flags.includes("g")
+          ? patterns[i].flags
+          : patterns[i].flags + "g";
+        const re = new RegExp(patterns[i].source, flags);
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(text)) !== null) {
+          results[i].add(m[0]);
+        }
+      }
+      tail = raw.length > SCAN_OVERLAP ? raw.slice(-SCAN_OVERLAP) : raw;
+    });
+
+    stream.on("end", () => resolve(results.map((s) => [...s])));
+    stream.on("error", reject);
+  });
+}
+
+async function findClaudeBinary(): Promise<string | null> {
+  if (IS_WIN) {
+    // Check common Windows install paths first
+    const candidates = [
+      join(homedir(), ".claude", "local", "claude.exe"),
+      join(
+        homedir(),
+        "AppData",
+        "Local",
+        "Programs",
+        "claude-code",
+        "claude.exe",
+      ),
+    ];
+    for (const p of candidates) {
+      try {
+        await access(p);
+        return p;
+      } catch {}
+    }
+    // Fallback to PATH
+    try {
+      const { stdout } = await execFileAsync("where", ["claude"], {
+        timeout: 3000,
+      });
+      const first = stdout.trim().split(/\r?\n/)[0];
+      if (first) return first.trim();
+    } catch {}
+    return null;
+  }
+  // Unix
+  try {
+    const { stdout } = await execFileAsync("which", ["claude"], {
       timeout: 3000,
     });
-    const binaryPath = whichOut.trim();
-    if (!binaryPath) return null;
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
 
+// Windows: single-pass streaming scan for both beta headers and scopes
+async function extractFromBinaryWin(
+  binaryPath: string,
+): Promise<{ betaHeaders: string[] | null; scopes: string | null }> {
+  const BETA_RE =
+    /[a-z]+-(?:[a-z0-9]+-)?20\d{2}-\d{2}-\d{2}|claude-code-\d+/g;
+  const SCOPE_RE = /(?:user|org):[a-z_:]+/g;
+
+  const [betaMatches, scopeMatches] = await streamScanBinary(binaryPath, [
+    BETA_RE,
+    SCOPE_RE,
+  ]);
+
+  const betaHeaders = betaMatches.filter((h) =>
+    KNOWN_BETA_PREFIXES.some((p) => h.startsWith(p)),
+  );
+  if (!betaHeaders.some((h) => h.startsWith("oauth-"))) {
+    betaHeaders.push("oauth-2025-04-20");
+  }
+
+  const scopes = scopeMatches.filter(
+    (s) =>
+      !s.includes("this") &&
+      !s.endsWith(":") &&
+      (s.startsWith("user:") || s.startsWith("org:")),
+  );
+
+  return {
+    betaHeaders: betaHeaders.length > 0 ? betaHeaders : null,
+    scopes: scopes.length > 0 ? scopes.join(" ") : null,
+  };
+}
+
+// Unix: use strings + grep (OS-level streaming, no memory issue)
+async function extractBetaHeadersUnix(
+  binaryPath: string,
+): Promise<string[] | null> {
+  try {
     const shellSafe = binaryPath.replace(/'/g, "'\\''");
-
-    const { stdout: betaOut } = await execFileAsync(
+    const { stdout } = await execFileAsync(
       "sh",
       [
         "-c",
@@ -72,16 +184,25 @@ async function introspectClaudeBinary(): Promise<{
       ],
       { timeout: 30_000 },
     );
-
-    const betaHeaders = betaOut
+    const headers = stdout
       .trim()
       .split("\n")
       .filter((h) => h && KNOWN_BETA_PREFIXES.some((p) => h.startsWith(p)));
-    if (!betaHeaders.some((h) => h.startsWith("oauth-"))) {
-      betaHeaders.push("oauth-2025-04-20");
+    if (!headers.some((h) => h.startsWith("oauth-"))) {
+      headers.push("oauth-2025-04-20");
     }
+    return headers.length > 0 ? headers : null;
+  } catch {
+    return null;
+  }
+}
 
-    const { stdout: scopeOut } = await execFileAsync(
+async function extractScopesUnix(
+  binaryPath: string,
+): Promise<string | null> {
+  try {
+    const shellSafe = binaryPath.replace(/'/g, "'\\''");
+    const { stdout } = await execFileAsync(
       "sh",
       [
         "-c",
@@ -89,8 +210,7 @@ async function introspectClaudeBinary(): Promise<{
       ],
       { timeout: 30_000 },
     );
-
-    const scopeList = scopeOut
+    const scopes = stdout
       .trim()
       .split("\n")
       .filter(
@@ -100,18 +220,93 @@ async function introspectClaudeBinary(): Promise<{
           !s.endsWith(":") &&
           (s.startsWith("user:") || s.startsWith("org:")),
       );
-    const scopes =
-      scopeList.length > 0 ? scopeList.join(" ") : DEFAULT_SCOPES;
+    return scopes.length > 0 ? scopes.join(" ") : null;
+  } catch {
+    return null;
+  }
+}
+
+async function introspectClaudeBinary(): Promise<IntrospectionResult | null> {
+  try {
+    const { stdout: versionOut } = await execFileAsync(
+      CLAUDE_CMD,
+      ["--version"],
+      { timeout: 5000 },
+    );
+    const version = versionOut.trim().split(" ")[0] || DEFAULT_VERSION;
+
+    const binaryPath = await findClaudeBinary();
+    if (!binaryPath) {
+      // Can still return version-only result
+      return {
+        version,
+        userAgent: `claude-cli/${version} (external, cli)`,
+        betaHeaders: DEFAULT_BETA_HEADERS,
+        scopes: DEFAULT_SCOPES,
+      };
+    }
+
+    let betaHeaders: string[] | null;
+    let scopes: string | null;
+
+    if (IS_WIN) {
+      // Single streaming pass — peak ~256KB, not 500MB+
+      const extracted = await extractFromBinaryWin(binaryPath);
+      betaHeaders = extracted.betaHeaders;
+      scopes = extracted.scopes;
+    } else {
+      // Unix: OS-level streaming via strings | grep (parallel)
+      [betaHeaders, scopes] = await Promise.all([
+        extractBetaHeadersUnix(binaryPath),
+        extractScopesUnix(binaryPath),
+      ]);
+    }
 
     return {
       version,
       userAgent: `claude-cli/${version} (external, cli)`,
-      betaHeaders,
-      scopes,
+      betaHeaders: betaHeaders ?? DEFAULT_BETA_HEADERS,
+      scopes: scopes ?? DEFAULT_SCOPES,
     };
   } catch {
     return null;
   }
+}
+
+// ── Lazy Introspection ──────────────────────────────────────────────────────
+// Starts in background during plugin init — does NOT block OpenCode startup.
+// Uses safe defaults until the scan completes.
+// authorize() for browser method awaits completion for accurate scopes.
+
+let _intro: IntrospectionResult = {
+  version: DEFAULT_VERSION,
+  userAgent: `claude-cli/${DEFAULT_VERSION} (external, cli)`,
+  betaHeaders: DEFAULT_BETA_HEADERS,
+  scopes: DEFAULT_SCOPES,
+};
+let _introPromise: Promise<void> | null = null;
+
+/** Non-blocking — returns current values (defaults or introspected) */
+function getIntro(): IntrospectionResult {
+  return _intro;
+}
+
+/** Blocking — waits for introspection to finish, then returns final values */
+async function awaitIntro(): Promise<IntrospectionResult> {
+  if (_introPromise) await _introPromise;
+  return _intro;
+}
+
+/** Fire-and-forget — call once at plugin init */
+function startIntro(): void {
+  _introPromise = introspectClaudeBinary()
+    .then((result) => {
+      if (result) _intro = result;
+    })
+    .catch(() => {})
+    .finally(() => {
+      _introPromise = null;
+    });
 }
 
 // ── Network Utilities ────────────────────────────────────────────────────────
@@ -140,9 +335,7 @@ function base64url(buf: Buffer): string {
 
 function createAuthorizationRequest(scopes: string) {
   const verifier = base64url(randomBytes(32));
-  const challenge = base64url(
-    createHash("sha256").update(verifier).digest(),
-  );
+  const challenge = base64url(createHash("sha256").update(verifier).digest());
   const params = new URLSearchParams({
     code: "true",
     response_type: "code",
@@ -201,9 +394,7 @@ async function exchangeCodeForTokens(
 
 let refreshInFlight: Promise<OAuthTokens> | null = null;
 
-async function refreshTokens(
-  refreshToken: string,
-): Promise<OAuthTokens> {
+async function refreshTokens(refreshToken: string): Promise<OAuthTokens> {
   const res = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -236,9 +427,7 @@ function refreshTokensSafe(refreshToken: string): Promise<OAuthTokens> {
 
 // ── Claude Code Credential Reader ────────────────────────────────────────────
 
-async function readKeychainEntry(
-  account?: string,
-): Promise<string | null> {
+async function readKeychainEntry(account?: string): Promise<string | null> {
   try {
     const args = ["find-generic-password", "-s", "Claude Code-credentials"];
     if (account) args.push("-a", account);
@@ -286,7 +475,7 @@ async function readClaudeCodeCredentials(): Promise<OAuthTokens | null> {
 
 async function refreshViaClaudeCli(): Promise<OAuthTokens | null> {
   try {
-    await execFileAsync("claude", ["-p", ".", "--model", "haiku", "hi"], {
+    await execFileAsync(CLAUDE_CMD, ["-p", ".", "--model", "haiku", "hi"], {
       timeout: 30_000,
       env: { ...process.env, TERM: "dumb" },
     });
@@ -300,7 +489,8 @@ function isExpiringSoon(expiresAt: number): boolean {
 
 async function hasClaude(): Promise<boolean> {
   try {
-    await execFileAsync("which", ["claude"], { timeout: 3000 });
+    const cmd = IS_WIN ? "where" : "which";
+    await execFileAsync(cmd, [CLAUDE_CMD], { timeout: 3000 });
     return true;
   } catch {
     return false;
@@ -308,14 +498,15 @@ async function hasClaude(): Promise<boolean> {
 }
 
 // ── Custom Fetch (Bearer auth + tool renaming + prompt sanitization) ─────────
+// Reads userAgent/betaHeaders from getIntro() on every request so values
+// auto-upgrade once background introspection completes.
 
 function createCustomFetch(
   getAuth: () => Promise<any>,
   client: any,
-  userAgent: string,
-  betaHeaders: string[],
 ) {
   return async (input: any, init?: any): Promise<Response> => {
+    const { userAgent, betaHeaders } = getIntro();
     const auth = await getAuth();
     if (auth.type !== "oauth") return fetch(input, init);
 
@@ -433,11 +624,15 @@ function createCustomFetch(
       } else if (input instanceof Request) {
         reqUrl = new URL(input.url);
       }
-      if (reqUrl?.pathname === "/v1/messages" && !reqUrl.searchParams.has("beta")) {
+      if (
+        reqUrl?.pathname === "/v1/messages" &&
+        !reqUrl.searchParams.has("beta")
+      ) {
         reqUrl.searchParams.set("beta", "true");
-        reqInput = input instanceof Request
-          ? new Request(reqUrl.toString(), input)
-          : reqUrl;
+        reqInput =
+          input instanceof Request
+            ? new Request(reqUrl.toString(), input)
+            : reqUrl;
       }
     } catch {}
 
@@ -478,12 +673,9 @@ function createCustomFetch(
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
 const plugin: Plugin = async ({ client }) => {
-  const introspection = await introspectClaudeBinary();
-
-  const userAgent =
-    introspection?.userAgent ?? `claude-cli/${DEFAULT_VERSION} (external, cli)`;
-  const betaHeaders = introspection?.betaHeaders ?? DEFAULT_BETA_HEADERS;
-  const scopes = introspection?.scopes ?? DEFAULT_SCOPES;
+  // Background init — does NOT block OpenCode startup.
+  // Uses safe defaults until introspection completes.
+  startIntro();
 
   return {
     auth: {
@@ -497,7 +689,7 @@ const plugin: Plugin = async ({ client }) => {
           }
           return {
             apiKey: "",
-            fetch: createCustomFetch(getAuth, client, userAgent, betaHeaders),
+            fetch: createCustomFetch(getAuth, client),
           };
         }
         return {};
@@ -515,7 +707,7 @@ const plugin: Plugin = async ({ client }) => {
                   "Claude CLI not found. Install it first:\n\n" +
                   "  npm install -g @anthropic-ai/claude-code\n\n" +
                   "Then run `claude` to log in.\n" +
-                  "Or use the \"Claude Pro/Max (browser)\" method below.",
+                  'Or use the "Claude Pro/Max (browser)" method below.',
                 method: "auto" as const,
                 async callback() {
                   return { type: "failed" as const };
@@ -555,10 +747,12 @@ const plugin: Plugin = async ({ client }) => {
         {
           type: "oauth" as const,
           label: "Claude Pro/Max (browser)",
-          authorize() {
+          async authorize() {
+            // Await introspection for accurate scopes in the OAuth URL
+            const { scopes } = await awaitIntro();
             const { url, verifier } = createAuthorizationRequest(scopes);
             let exchangePromise: Promise<any> | null = null;
-            return Promise.resolve({
+            return {
               url,
               instructions:
                 "Open the link above to authenticate with your Claude account. " +
@@ -571,7 +765,7 @@ const plugin: Plugin = async ({ client }) => {
                     const tokens = await exchangeCodeForTokens(
                       code,
                       verifier,
-                      userAgent,
+                      getIntro().userAgent,
                     );
                     return { type: "success" as const, ...tokens };
                   } catch {
@@ -580,7 +774,7 @@ const plugin: Plugin = async ({ client }) => {
                 })();
                 return exchangePromise;
               },
-            });
+            };
           },
         },
         {
