@@ -395,16 +395,26 @@ async function exchangeCodeForTokens(
 let refreshInFlight: Promise<OAuthTokens> | null = null;
 
 async function refreshTokens(refreshToken: string): Promise<OAuthTokens> {
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }),
+  const { userAgent } = getIntro();
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: CLIENT_ID,
   });
-  if (!res.ok) throw new Error(`Token refresh failed: ${res.status}`);
+  const res = await fetchWithRetry(TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": userAgent,
+    },
+    body: body.toString(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Token refresh failed: ${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`,
+    );
+  }
   const data = (await res.json()) as {
     access_token: string;
     refresh_token: string;
@@ -485,10 +495,14 @@ async function readClaudeCodeCredentials(): Promise<OAuthTokens | null> {
 
 async function refreshViaClaudeCli(): Promise<OAuthTokens | null> {
   try {
-    await execFileAsync(CLAUDE_CMD, ["-p", ".", "--model", "haiku", "hi"], {
-      timeout: 30_000,
-      env: { ...process.env, TERM: "dumb" },
-    });
+    await execFileAsync(
+      CLAUDE_CMD,
+      ["--print", "--model", "claude-haiku-4", "ping"],
+      {
+        timeout: 30_000,
+        env: { ...process.env, TERM: "dumb" },
+      },
+    );
   } catch {}
   return readClaudeCodeCredentials();
 }
@@ -552,7 +566,11 @@ async function findAlternateCredentials(
 ): Promise<OAuthTokens | null> {
   // Check main CLI credentials
   const main = await readClaudeCodeCredentials();
-  if (main && main.refresh !== currentRefresh && !isExpiringSoon(main.expires)) {
+  if (
+    main &&
+    main.refresh !== currentRefresh &&
+    !isExpiringSoon(main.expires)
+  ) {
     return main;
   }
   // Check all CCS instances
@@ -586,8 +604,11 @@ function createCustomFetch(getAuth: () => Promise<any>, client: any) {
       currentRefreshToken = auth.refresh;
     }
 
-    // Refresh if expired
-    if (!auth.access || auth.expires < Date.now()) {
+    // Refresh proactively (before expiry) or if already expired
+    if (!auth.access || auth.expires < Date.now() + REFRESH_BUFFER_MS) {
+      let refreshed = false;
+
+      // 1) Try OAuth refresh
       try {
         const fresh = await refreshTokensSafe(auth.refresh);
         await client.auth.set({
@@ -600,9 +621,14 @@ function createCustomFetch(getAuth: () => Promise<any>, client: any) {
           },
         });
         auth.access = fresh.access;
-      } catch {
+        auth.refresh = fresh.refresh;
+        auth.expires = fresh.expires;
+        refreshed = true;
+      } catch {}
+
+      // 2) Try reading Claude CLI credentials (with expired fallback to CLI refresh)
+      if (!refreshed) {
         let kc = await readClaudeCodeCredentials();
-        // If CLI credentials are also expired, trigger a CLI refresh
         if (!kc || isExpiringSoon(kc.expires)) {
           kc = await refreshViaClaudeCli();
         }
@@ -614,7 +640,26 @@ function createCustomFetch(getAuth: () => Promise<any>, client: any) {
             body: { type: "oauth", ...kc },
           });
           auth.access = kc.access;
+          auth.refresh = kc.refresh;
+          auth.expires = kc.expires;
+          refreshed = true;
         }
+      }
+
+      // 3) Last resort: trigger Claude CLI to refresh its own token
+      if (!refreshed) {
+        try {
+          const kc = await refreshViaClaudeCli();
+          if (kc && !isExpiringSoon(kc.expires)) {
+            await client.auth.set({
+              path: { id: "anthropic" },
+              body: { type: "oauth", ...kc },
+            });
+            auth.access = kc.access;
+            auth.refresh = kc.refresh;
+            auth.expires = kc.expires;
+          }
+        } catch {}
       }
     }
 
